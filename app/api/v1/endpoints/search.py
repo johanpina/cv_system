@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlmodel import Session, select, desc
@@ -41,11 +41,13 @@ def obtener_sedes_activas(sede_obj) -> List[str]:
     ]
     return [c for c in columnas if getattr(sede_obj, c, False)]
 
-def calcular_reranking(match_score, info_db) -> (float, List[str]):
+
+def calcular_reranking(match_score, info_db) -> Tuple[float, List[str]]:
     nuevo_score = match_score
     bonus_log = []
     
     if info_db:
+        # 1. Reglas de Bonificación
         posgrado = (info_db.titulo_posgrado or "").lower()
         if 'doctor' in posgrado or 'phd' in posgrado:
             nuevo_score += 0.2
@@ -55,11 +57,14 @@ def calcular_reranking(match_score, info_db) -> (float, List[str]):
             bonus_log.append("Maestría (+0.1)")
             
         experiencia = (info_db.tiene_experiencia or "").lower()
-        if experiencia in ['si', 'sí', 's', 'true']:
+        if experiencia in ['si', 'sí', 's', 'true', '1']:
             nuevo_score += 0.05
             bonus_log.append("Tiene Experiencia (+0.05)")
 
-    return round(nuevo_score, 4), bonus_log
+    # 2. ESTANDARIZACIÓN (Tope máximo 100%)
+    score_final_normalizado = min(1.0, nuevo_score)
+
+    return round(score_final_normalizado, 4), bonus_log
 
 # --- Endpoint Principal ---
 @router.post("/", response_model=List[SearchResult])
