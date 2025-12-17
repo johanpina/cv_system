@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlmodel
+pydantic-settings
+python-multipart
+python-dotenv
+# Librerías futuras para IA (podemos instalarlas luego, pero mejor tenerlas mapeadas)
+google-generativeai
+pinecone

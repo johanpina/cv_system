@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+.env
+scripts/credentials.json
+node_modules/
+.DS_Store
