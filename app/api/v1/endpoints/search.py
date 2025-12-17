@@ -3,7 +3,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlmodel import Session, select, desc
 from app.core.database import engine
-from app.models.models import Aspirante, Aspirante_Sede
+from app.models.models import Aspirante, Aspirante_Sede, Url_HojaDeVida
 from app.services.pinecone_service import search_best_matches
 
 router = APIRouter()
@@ -130,13 +130,20 @@ def search_candidates(request: SearchRequest):
 
             info = aspirante_db.informacion
             sede = aspirante_db.sede
+
+            # A. Obtener el texto analizado por la IA (Donde está la experiencia real)
+            hoja_vida_obj = session.exec(select(Url_HojaDeVida).where(Url_HojaDeVida.id_aspirante == aspirante_db.id_aspirante)).first()
+            texto_ia = hoja_vida_obj.resumen_estructurado if hoja_vida_obj and hoja_vida_obj.resumen_estructurado else "Sin análisis detallado disponible."
+            
             
             # Construcción del Resumen Rico
             resumen_rico = (
                 f"🎓 Título: {info.titulo_profesional if info else 'N/A'}\n"
                 f"📚 Posgrado: {info.titulo_posgrado if info else 'N/A'}\n"
-                f"🕒 Disponibilidad: {info.disponibilidad if info else 'N/A'}\n"
+                f"🕒 Disponibilidad: {info.disponibilidad if info else 'No especificada'}\n"
+                f"📋 Detalle Experiencia: {getattr(info, 'detalle_experiencia', 'Sin registro manual')}\n"
                 f"📧 Email: {aspirante_db.email}\n"
+                f"{texto_ia}" # <--- AQUÍ INYECTAMOS LA EXPERIENCIA Y PERFIL
             )
 
             # Cálculo de Scores
