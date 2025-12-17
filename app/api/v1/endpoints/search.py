@@ -1,11 +1,14 @@
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
+from sqlmodel import Session, select
+from app.core.database import engine
+from app.models.models import Aspirante  # Asegúrate de importar tus modelos
 from app.services.pinecone_service import search_best_matches
 
 router = APIRouter()
 
-# --- Modelos de Datos (Request/Response) ---
+# --- Modelos ---
 class SearchRequest(BaseModel):
     query: str
     municipio: Optional[str] = None
@@ -14,60 +17,62 @@ class SearchRequest(BaseModel):
 class SearchResult(BaseModel):
     id_aspirante: str
     nombre: str
+    email: str
+    celular: str
     score_semantico: float
     score_final: float
     municipios: List[str]
     titulo_profesional: str
     titulo_posgrado: str
-    resumen: str
-    bonificaciones: List[str] # Para explicar por qué subió el puntaje
+    resumen: str  # <--- Aquí irá el texto rico
+    bonificaciones: List[str]
 
-# --- Lógica de Re-ranking ---
-def calcular_reranking(match) -> (float, List[str]):
-    """
-    Aplica reglas de negocio para ajustar el puntaje.
-    """
+# --- Lógica de Re-ranking (Sin cambios) ---
+def calcular_reranking(match, info_db) -> (float, List[str]):
     score_base = match.score
-    meta = match.metadata
+    nuevo_score = score_base
     bonus_log = []
     
-    nuevo_score = score_base
-    
-    # Regla 1: Bonificación por Doctorado (+0.2)
-    posgrado = meta.get('titulo_posgrado', '').lower()
-    if 'doctor' in posgrado or 'phd' in posgrado:
-        nuevo_score += 0.2
-        bonus_log.append("Doctorado (+0.2)")
-    # Regla 2: Bonificación por Maestría (+0.1) si no es doctor
-    elif 'maestr' in posgrado or 'magister' in posgrado or 'master' in posgrado:
-        nuevo_score += 0.1
-        bonus_log.append("Maestría (+0.1)")
-        
-    # Regla 3: Bonificación por Experiencia (+0.05)
-    # Nota: Aquí podríamos ser más precisos si tuviéramos años exactos parseados
-    experiencia = meta.get('tiene_experiencia', '').lower()
-    if 'si' in experiencia or 'yes' in experiencia:
-        nuevo_score += 0.05
-        bonus_log.append("Tiene Experiencia (+0.05)")
+    # Usamos info_db (datos frescos de SQL) para el re-ranking
+    if info_db:
+        posgrado = (info_db.titulo_posgrado or "").lower()
+        if 'doctor' in posgrado or 'phd' in posgrado:
+            nuevo_score += 0.2
+            bonus_log.append("Doctorado (+0.2)")
+        elif 'maestr' in posgrado or 'magister' in posgrado:
+            nuevo_score += 0.1
+            bonus_log.append("Maestría (+0.1)")
+            
+        experiencia = (info_db.tiene_experiencia or "").lower()
+        if experiencia in ['si', 'sí', 's', 'true']:
+            nuevo_score += 0.05
+            bonus_log.append("Tiene Experiencia (+0.05)")
 
     return round(nuevo_score, 4), bonus_log
+
+# --- Función auxiliar para obtener sedes ---
+def obtener_sedes_activas(sede_obj) -> List[str]:
+    if not sede_obj: return []
+    columnas = [
+        "Manizales", "Chinchiná", "Villamaría", "Neira", "Palestina", 
+        "Risaralda", "Riosucio", "Anserma", "La_Dorada", "Supia", 
+        "Palestina_Arauca", "Arauca", "Viterbo", "Salamina", "Belalcazar", 
+        "Filadelfia", "Aguadas", "San_José", "Pacora", "Victoria", 
+        "Manzanares", "Norcasia", "Samaná"
+    ]
+    return [c for c in columnas if getattr(sede_obj, c, False)]
 
 # --- Endpoint ---
 @router.post("/", response_model=List[SearchResult])
 def search_candidates(request: SearchRequest):
-    """
-    Buscador Híbrido: Semántica + Filtros + Lógica de Negocio
-    """
     print(f"📡 Recibiendo búsqueda: {request.query}")
     
-    # 1. Construir filtros para Pinecone
+    # 1. Filtros Pinecone
     filtros = {}
-    if request.municipio:
-        # Sintaxis de Pinecone para arrays: "municipios" contiene el valor X
+    if request.municipio and request.municipio != "Todos":
         filtros["municipios"] = {"$in": [request.municipio]}
     
-    # 2. Búsqueda Semántica (Traemos más candidatos para luego filtrar/reordenar)
-    # Traemos el doble (20) para tener margen en el re-ranking
+    # 2. Búsqueda Vectorial
     raw_results = search_best_matches(request.query, filters=filtros if filtros else None, top_k=request.top_k * 2)
     
     if not raw_results or not hasattr(raw_results, 'matches'):
@@ -75,26 +80,46 @@ def search_candidates(request: SearchRequest):
 
     processed_results = []
     
-    # 3. Procesamiento y Re-ranking
-    for match in raw_results.matches:
-        meta = match.metadata or {}
-        
-        final_score, bonuses = calcular_reranking(match)
-        
-        processed_results.append(SearchResult(
-            id_aspirante=match.id,
-            nombre=meta.get('nombre', 'Anónimo'),
-            score_semantico=round(match.score, 4),
-            score_final=final_score,
-            municipios=meta.get('municipios', []),
-            titulo_profesional=meta.get('titulo_profesional', 'No registrado'),
-            titulo_posgrado=meta.get('titulo_posgrado', 'No registrado'),
-            resumen=meta.get('text', '')[:300] + "...", # Recorte para la UI
-            bonificaciones=bonuses
-        ))
+    with Session(engine) as session:
+        for match in raw_results.matches:
+            # 3. Hidratación de Datos (Consultar SQL por ID)
+            aspirante_id = int(match.id)
+            aspirante_db = session.get(Aspirante, aspirante_id)
+            
+            if not aspirante_db:
+                continue # Si no está en SQL, saltar
+                
+            info = aspirante_db.informacion
+            sede = aspirante_db.sede
+            
+            # 4. Construcción del Resumen Rico
+            # Armamos un bloque de texto con saltos de línea para que se vea bien en el frontend
+            resumen_rico = (
+                f"🎓 Título: {info.titulo_profesional if info else 'N/A'}\n"
+                f"📚 Posgrado: {info.titulo_posgrado if info else 'N/A'}\n"
+                f"🕒 Disponibilidad: {info.disponibilidad if info else 'N/A'}\n"
+                f"💼 Detalle Experiencia: {getattr(info, 'detalle_experiencia', getattr(info, 'tiene_experiencia', 'N/A'))}\n"
+                f"📧 Email: {aspirante_db.email}\n"
+                f"📱 Celular: {aspirante_db.celular}"
+            )
 
-    # 4. Ordenar por Score Final (Mayor a menor)
+            # 5. Cálculos Finales
+            final_score, bonuses = calcular_reranking(match, info)
+            
+            processed_results.append(SearchResult(
+                id_aspirante=str(aspirante_db.id_aspirante),
+                nombre=aspirante_db.nombre_completo,
+                email=aspirante_db.email,
+                celular=aspirante_db.celular,
+                score_semantico=round(match.score, 4),
+                score_final=final_score,
+                municipios=obtener_sedes_activas(sede),
+                titulo_profesional=info.titulo_profesional if info else "",
+                titulo_posgrado=info.titulo_posgrado if info else "",
+                resumen=resumen_rico, # <--- Usamos el texto construido
+                bonificaciones=bonuses
+            ))
+
+    # 6. Ordenar y cortar
     processed_results.sort(key=lambda x: x.score_final, reverse=True)
-    
-    # 5. Devolver solo el top solicitado por el usuario
     return processed_results[:request.top_k]
